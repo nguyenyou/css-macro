@@ -258,6 +258,34 @@ class CssMacroTest extends munit.FunSuite {
     assert(styles.css.contains(".icon .btn"))
   }
 
+  test("handles ancestor selector with BEM and complex pseudo-selectors") {
+    val styles = css"""
+      .checkbox {
+        display: flex;
+
+        &__box {
+          border: 1px solid gray;
+
+          .js-focus-visible &:not(.focus-visible):focus {
+            outline-color: transparent;
+          }
+        }
+      }
+    """
+    // Should generate .js-focus-visible .checkbox__box:not(.focus-visible):focus
+    assert(styles.css.contains(".checkbox {"))
+    assert(styles.css.contains(".checkbox__box {"))
+    assert(
+      styles.css.contains(
+        ".js-focus-visible .checkbox__box:not(.focus-visible):focus"
+      )
+    )
+    assertEquals(styles.classNames.checkbox, "checkbox")
+    assertEquals(styles.classNames.`checkbox__box`, "checkbox__box")
+    assertEquals(styles.classNames.`js-focus-visible`, "js-focus-visible")
+    assertEquals(styles.classNames.`focus-visible`, "focus-visible")
+  }
+
   test("handles multiple & in same selector") {
     val styles = css"""
       .item {
