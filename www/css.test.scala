@@ -771,6 +771,209 @@ class CssMacroTest extends munit.FunSuite {
     assert(bIdx < cIdx, "child-b should come before child-c")
   }
 
+  // === Web Component Tests ===
+
+  test("handles :host selector") {
+    val styles = css"""
+      :host {
+        display: block;
+        contain: content;
+      }
+    """
+    assert(styles.css.contains(":host {"))
+    assert(styles.css.contains("display: block"))
+    assert(styles.css.contains("contain: content"))
+  }
+
+  test("handles :host with attribute selectors") {
+    val styles = css"""
+      :host {
+        display: block;
+
+        &([disabled]) {
+          opacity: 0.5;
+          pointer-events: none;
+        }
+
+        &([size="large"]) {
+          padding: 24px;
+        }
+
+        &([variant="primary"]) {
+          background: blue;
+          color: white;
+        }
+
+        &(:hover) {
+          box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+      }
+    """
+    assert(styles.css.contains(":host {"))
+    assert(styles.css.contains(":host([disabled])"))
+    assert(styles.css.contains(":host([size=\"large\"])"))
+    assert(styles.css.contains(":host([variant=\"primary\"])"))
+    assert(styles.css.contains(":host(:hover)"))
+    assert(styles.css.contains("opacity: 0.5"))
+    assert(styles.css.contains("padding: 24px"))
+  }
+
+  test("handles :host-context selector") {
+    val styles = css"""
+      :host-context(.dark-theme) {
+        background: #1a1a1a;
+        color: white;
+      }
+
+      :host-context([dir="rtl"]) {
+        direction: rtl;
+      }
+    """
+    assert(styles.css.contains(":host-context(.dark-theme)"))
+    assert(styles.css.contains(":host-context([dir=\"rtl\"])"))
+  }
+
+  test("handles ::slotted selector") {
+    val styles = css"""
+      ::slotted(*) {
+        margin: 0;
+        padding: 0;
+      }
+
+      ::slotted(p) {
+        line-height: 1.6;
+      }
+
+      ::slotted(.highlight) {
+        background: yellow;
+      }
+
+      ::slotted([slot="header"]) {
+        font-size: 24px;
+        font-weight: bold;
+      }
+    """
+    assert(styles.css.contains("::slotted(*)"))
+    assert(styles.css.contains("::slotted(p)"))
+    assert(styles.css.contains("::slotted(.highlight)"))
+    assert(styles.css.contains("::slotted([slot=\"header\"])"))
+    assert(styles.css.contains("line-height: 1.6"))
+  }
+
+  test("handles ::slotted with :host nesting") {
+    val styles = css"""
+      :host {
+        display: block;
+
+        ::slotted(*) {
+          box-sizing: border-box;
+        }
+
+        ::slotted(p:first-child) {
+          margin-top: 0;
+        }
+
+        ::slotted(p:last-child) {
+          margin-bottom: 0;
+        }
+      }
+    """
+    assert(styles.css.contains(":host {"))
+    assert(styles.css.contains(":host ::slotted(*)"))
+    assert(styles.css.contains(":host ::slotted(p:first-child)"))
+    assert(styles.css.contains(":host ::slotted(p:last-child)"))
+  }
+
+  test("handles :host with nested class selectors") {
+    val styles = css"""
+      :host {
+        display: flex;
+
+        .container {
+          flex: 1;
+
+          .header {
+            font-size: 20px;
+          }
+
+          .content {
+            padding: 16px;
+          }
+        }
+      }
+    """
+    assert(styles.css.contains(":host {"))
+    assert(styles.css.contains(":host .container"))
+    assert(styles.css.contains(":host .container .header"))
+    assert(styles.css.contains(":host .container .content"))
+    assertEquals(styles.classNames.container, "container")
+    assertEquals(styles.classNames.header, "header")
+    assertEquals(styles.classNames.content, "content")
+  }
+
+  test("handles ::part selector") {
+    val styles = css"""
+      ::part(button) {
+        background: blue;
+        color: white;
+      }
+
+      ::part(button):hover {
+        background: darkblue;
+      }
+
+      ::part(input):focus {
+        outline: 2px solid blue;
+      }
+    """
+    assert(styles.css.contains("::part(button) {"))
+    assert(styles.css.contains("::part(button):hover"))
+    assert(styles.css.contains("::part(input):focus"))
+  }
+
+  test("handles complete web component styling pattern") {
+    val styles = css"""
+      :host {
+        --component-bg: white;
+        --component-color: black;
+        display: block;
+
+        &([theme="dark"]) {
+          --component-bg: #1a1a1a;
+          --component-color: white;
+        }
+      }
+
+      .wrapper {
+        background: var(--component-bg);
+        color: var(--component-color);
+
+        &__header {
+          padding: 16px;
+          border-bottom: 1px solid #eee;
+        }
+
+        &__body {
+          padding: 16px;
+        }
+      }
+
+      ::slotted(*) {
+        margin: 8px 0;
+      }
+    """
+    assert(styles.css.contains(":host {"))
+    assert(styles.css.contains(":host([theme=\"dark\"])"))
+    assert(styles.css.contains("--component-bg: white"))
+    assert(styles.css.contains(".wrapper {"))
+    assert(styles.css.contains(".wrapper__header"))
+    assert(styles.css.contains(".wrapper__body"))
+    assert(styles.css.contains("::slotted(*)"))
+    assertEquals(styles.classNames.wrapper, "wrapper")
+    assertEquals(styles.classNames.`wrapper__header`, "wrapper__header")
+    assertEquals(styles.classNames.`wrapper__body`, "wrapper__body")
+  }
+
   // === Validation Tests (compile-time errors) ===
   // These tests verify that invalid CSS produces compile-time errors
   // We use compiletime.testing.typeCheckErrors to verify error messages
