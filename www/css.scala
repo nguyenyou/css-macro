@@ -201,6 +201,14 @@ object CssMacro {
   // Pre-compiled regex pattern for extracting CSS class names
   private val classPattern = """\.([\w-]+)""".r
 
+  /** Implicit conversion to extract just the CSS string when assigned to a
+    * String. Usage: import CssMacro.css import CssMacro.cssResultToString // or
+    * use `given` import val s: String = css".button { color: red; }" //
+    * extracts just the CSS string
+    */
+  given cssResultToString[T]: Conversion[(css: String, classNames: T), String] =
+    result => result.css
+
   // String interpolator version: css"..." with interpolation support
   extension (inline sc: StringContext) {
     transparent inline def css(inline args: Any*): Any = ${

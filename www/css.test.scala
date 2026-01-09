@@ -1058,4 +1058,39 @@ class CssMacroTest extends munit.FunSuite {
     """
     assert(styles.css.contains(".a .b .c .d"))
   }
+
+  // === Implicit Conversion Tests ===
+
+  test("implicit conversion to String when type annotated") {
+    import CssMacro.cssResultToString
+    val cssString: String = css".button { color: red; }"
+    assert(cssString.contains(".button"))
+    assert(cssString.contains("color: red"))
+  }
+
+  test("implicit conversion works with interpolation") {
+    import CssMacro.cssResultToString
+    val color = "blue"
+    val cssString: String = css".link { color: $color; }"
+    assert(cssString.contains("color: blue"))
+  }
+
+  test("implicit conversion works with nested selectors") {
+    import CssMacro.cssResultToString
+    val cssString: String = css"""
+      .parent {
+        .child { color: green; }
+      }
+    """
+    assert(cssString.contains(".parent .child"))
+    assert(cssString.contains("color: green"))
+  }
+
+  test("implicit conversion can be used in function expecting String") {
+    import CssMacro.cssResultToString
+    def useString(s: String): String = s.toUpperCase
+    val result = useString(css".test { display: block; }")
+    assert(result.contains(".TEST"))
+    assert(result.contains("DISPLAY: BLOCK"))
+  }
 }
