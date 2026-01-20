@@ -444,8 +444,8 @@ The `css` interpolator returns a named tuple with two fields:
 
 ```bash
 # Run tests
-scala-cli test .
+scala-cli test src
 
 # Run example
-scala-cli run .
+scala-cli run src
 ```
