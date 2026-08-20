@@ -488,3 +488,55 @@ scala-cli test src --js-runtime bun
 # Run example
 scala-cli run src --js-runtime bun
 ```
+
+## Benchmarking
+
+The repository includes a repeatable benchmark for the two performance-critical
+paths:
+
+- **Compile-time macro expansion**: wall-clock time and peak resident memory for
+  a large static stylesheet. A control compilation processes the same source
+  without expanding the macro, making compiler and launcher overhead visible.
+- **Runtime flattening**: time per operation, peak resident memory, and maximum
+  observed Bun heap while flattening a large dynamic nested stylesheet.
+
+Run the full benchmark on an otherwise idle machine:
+
+```bash
+bun benchmark/benchmark.ts --output .benchmark-results/current.json
+```
+
+For a quick smoke run:
+
+```bash
+bun benchmark/benchmark.ts --quick
+```
+
+Use quick mode only to verify that the benchmark works; its single sample is
+not suitable for performance comparisons.
+
+To compare a change fairly, use the same machine and save a baseline from the
+base revision. The runner refuses to compare results with different workload
+sizes or sample counts.
+
+```bash
+# On the base revision
+bun benchmark/benchmark.ts --output .benchmark-results/base.json
+
+# On the revision being evaluated
+bun benchmark/benchmark.ts \
+  --baseline .benchmark-results/base.json \
+  --output .benchmark-results/change.json
+```
+
+Each measured compiler sample uses a fresh Scala CLI workspace and disables the
+compilation server. Dependencies are prepared before timing. Compile samples
+alternate control/macro order, while runtime samples use fresh Bun processes.
+Peak resident memory comes from the operating system's child-process resource
+usage rather than periodic sampling. Runtime heap is observed after each
+operation while its output is still live. The JSON output contains every raw
+sample plus machine, toolchain, workload, and Git revision metadata.
+
+Benchmark numbers are meaningful only when compared on the same machine with
+the same toolchain and no competing workload. Use `--help` to tune workload
+sizes, sample counts, or run only the compile/runtime suite.
