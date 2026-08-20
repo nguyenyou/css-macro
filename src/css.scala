@@ -1,215 +1,878 @@
 package www
 
-import scala.quoted.*
 import scala.collection.mutable
+import scala.quoted.*
+import scala.reflect.NameTransformer
 
-/** CSS Nested Selector Flattener - converts SCSS-like nesting to flat CSS */
+/** Runtime carrier for statically known CSS class-name fields. */
+final class CssClassNames() extends Selectable {
+  transparent inline def selectDynamic(inline name: String): String =
+    NameTransformer.decode(name)
+}
+
+/** Flattens CSS nesting while preserving declarations, at-rules, and comments.
+  */
 object CssFlattener {
-  def flatten(css: String): String = {
-    val rules = parseBlock(css, "")
-    val sb = new StringBuilder
-    renderRules(rules, sb)
-    sb.toString
+  private sealed trait Item
+
+  private final case class Declaration(value: String) extends Item
+
+  private final case class Raw(value: String) extends Item
+
+  private final case class QualifiedRule(
+      selector: String,
+      items: List[Item]
+  ) extends Item
+
+  private final case class AtRule(
+      header: String,
+      items: Option[List[Item]]
+  ) extends Item
+
+  private enum Delimiter {
+    case OpenBrace(position: Int)
+    case Semicolon(position: Int)
+    case CloseBrace(position: Int)
+    case End
   }
 
-  private case class Rule(
-      selector: String,
-      properties: List[String],
-      children: List[Rule]
+  private final case class ParseFailure(message: String)
+      extends RuntimeException(message)
+
+  private[www] final case class Analysis(
+      css: String,
+      classNames: List[String]
   )
 
-  /** Skip over a quoted string, returning the index after the closing quote */
-  private def skipString(content: String, start: Int, quote: Char): Int = {
-    var i = start + 1
-    while (i < content.length) {
-      val c = content.charAt(i)
-      if (c == quote && content.charAt(i - 1) != '\\') {
-        return i + 1
-      }
-      i += 1
+  def flatten(css: String): String = {
+    process(css, "", collectClassNames = false) match {
+      case Right(analysis) => analysis.css
+      case Left(error)     => throw IllegalArgumentException(error)
     }
-    i
   }
 
-  private def parseBlock(
-      content: String,
-      parentSelector: String
-  ): List[Rule] = {
-    val rules = mutable.ListBuffer[Rule]()
-    var i = 0
-    val len = content.length
+  private[www] def analyze(
+      css: String,
+      dynamicMarkerPrefix: String
+  ): Either[String, Analysis] =
+    process(css, dynamicMarkerPrefix, collectClassNames = true)
 
-    while (i < len) {
-      // Skip whitespace
-      while (i < len && content.charAt(i).isWhitespace) i += 1
-      if (i >= len) return rules.toList
+  private def process(
+      css: String,
+      dynamicMarkerPrefix: String,
+      collectClassNames: Boolean
+  ): Either[String, Analysis] = {
+    try {
+      val items = Parser(css).parse()
+      Right(Renderer(dynamicMarkerPrefix, collectClassNames).render(items))
+    } catch {
+      case failure: ParseFailure => Left(failure.message)
+    }
+  }
 
-      // Find selector (everything before {), respecting strings
-      val selectorStart = i
-      while (i < len) {
-        val c = content.charAt(i)
-        if (c == '"' || c == '\'') {
-          i = skipString(content, i, c)
-        } else if (c == '{' || c == '}') {
-          // Found delimiter outside of string
-          i = i // break
-          return if (c == '}') rules.toList
-          else {
-            val selector = content.substring(selectorStart, i).trim
-            if (selector.isEmpty) {
-              i += 1
-              rules.toList
-            } else {
-              i += 1 // skip '{'
+  private final class Parser(content: String) {
+    private val length = content.length
+    private var index = 0
 
-              // Find matching closing brace, respecting strings
-              val bodyStart = i
-              var depth = 1
-              while (i < len && depth > 0) {
-                val bc = content.charAt(i)
-                if (bc == '"' || bc == '\'') {
-                  i = skipString(content, i, bc)
+    def parse(): List[Item] = parseItems(expectClosingBrace = false)
+
+    private def parseItems(expectClosingBrace: Boolean): List[Item] = {
+      val items = mutable.ListBuffer.empty[Item]
+      var done = false
+
+      while (!done) {
+        skipWhitespace()
+
+        if (index >= length) {
+          if (expectClosingBrace) {
+            fail("Unbalanced braces: unclosed '{' before end of input")
+          }
+          done = true
+        } else if (content.charAt(index) == '}') {
+          if (expectClosingBrace) {
+            index += 1
+            done = true
+          } else {
+            fail(s"Unexpected '}' at position $index - no matching '{'")
+          }
+        } else {
+          val start = index
+          findDelimiter(start) match {
+            case Delimiter.OpenBrace(position) =>
+              val header = content.substring(start, position).trim
+              if (containsOnlyTrivia(header)) {
+                fail(s"Missing selector before '{' at position $position")
+              }
+
+              index = position + 1
+              val body = parseItems(expectClosingBrace = true)
+              if (isAtRule(header)) {
+                items += AtRule(header, Some(body))
+              } else {
+                items += QualifiedRule(header, body)
+              }
+
+            case Delimiter.Semicolon(position) =>
+              val value = content.substring(start, position).trim
+              index = position + 1
+              if (value.nonEmpty) {
+                if (containsOnlyTrivia(value)) {
+                  items += Raw(s"$value;")
+                } else if (isAtRule(value)) {
+                  items += AtRule(value, None)
                 } else {
-                  bc match {
-                    case '{' => depth += 1; i += 1
-                    case '}' => depth -= 1; if (depth > 0) i += 1
-                    case _   => i += 1
-                  }
+                  items += Declaration(value)
                 }
               }
 
-              val body = content.substring(bodyStart, i)
-              i += 1 // skip '}'
-
-              // Parse body for properties and nested rules
-              val (properties, nestedContent) = parseBodyContent(body)
-
-              // Compute full selector
-              val fullSelector = if (parentSelector.isEmpty) {
-                selector
-              } else if (selector.contains("&")) {
-                selector.replace("&", parentSelector)
-              } else {
-                s"$parentSelector $selector"
+            case Delimiter.CloseBrace(position) =>
+              val value = content.substring(start, position).trim
+              if (value.nonEmpty) {
+                if (containsOnlyTrivia(value)) {
+                  items += Raw(value)
+                } else if (isAtRule(value)) {
+                  items += AtRule(value, None)
+                } else {
+                  items += Declaration(value)
+                }
               }
 
-              // Parse nested rules recursively
-              val children = parseBlock(nestedContent, fullSelector)
+              if (expectClosingBrace) {
+                index = position + 1
+                done = true
+              } else {
+                fail(s"Unexpected '}' at position $position - no matching '{'")
+              }
 
-              rules += Rule(fullSelector, properties, children)
-              // Continue parsing rest of content
-              rules ++= parseBlock(content.substring(i), parentSelector)
-              rules.toList
-            }
+            case Delimiter.End =>
+              val value = content.substring(start).trim
+              if (value.nonEmpty) {
+                if (containsOnlyTrivia(value)) {
+                  items += Raw(value)
+                } else if (expectClosingBrace) {
+                  fail("Unbalanced braces: unclosed '{' before end of input")
+                } else {
+                  fail(s"Expected '{' or ';' after '$value'")
+                }
+              } else if (expectClosingBrace) {
+                fail("Unbalanced braces: unclosed '{' before end of input")
+              }
+              index = length
+              done = true
           }
-        } else {
-          i += 1
         }
       }
-      // No more braces found
-      return rules.toList
+
+      items.toList
     }
-    rules.toList
-  }
 
-  private def parseBodyContent(body: String): (List[String], String) = {
-    val properties = mutable.ListBuffer[String]()
-    val nestedContent = new StringBuilder
-    var i = 0
-    val len = body.length
+    private def findDelimiter(start: Int): Delimiter = {
+      var cursor = start
+      var parenthesisDepth = 0
+      var bracketDepth = 0
+      var result: Delimiter = Delimiter.End
+      var done = false
 
-    while (i < len) {
-      // Skip whitespace
-      while (i < len && body.charAt(i).isWhitespace) i += 1
-      if (i >= len) return (properties.toList, nestedContent.toString)
-
-      // Check if this is a nested rule (contains {)
-      val lineStart = i
-
-      // Look ahead to see if this is a nested selector or a property
-      // Respect quoted strings
-      var j = i
-      var foundBrace = false
-      var foundSemicolon = false
-      while (j < len && !foundBrace && !foundSemicolon) {
-        val c = body.charAt(j)
-        if (c == '"' || c == '\'') {
-          j = skipString(body, j, c)
+      while (cursor < length && !done) {
+        val current = content.charAt(cursor)
+        if (current == '"' || current == '\'') {
+          cursor = skipString(cursor, current)
+        } else if (
+          current == '/' && cursor + 1 < length && content.charAt(
+            cursor + 1
+          ) == '*'
+        ) {
+          cursor = skipComment(cursor)
+        } else if (current == '\\') {
+          cursor = skipEscape(cursor)
         } else {
-          c match {
-            case '{' => foundBrace = true
-            case ';' => foundSemicolon = true
-            case _   => j += 1
+          current match {
+            case '(' =>
+              parenthesisDepth += 1
+              cursor += 1
+            case ')' =>
+              if (parenthesisDepth == 0) {
+                fail(s"Unexpected ')' at position $cursor")
+              }
+              parenthesisDepth -= 1
+              cursor += 1
+            case '[' =>
+              bracketDepth += 1
+              cursor += 1
+            case ']' =>
+              if (bracketDepth == 0) {
+                fail(s"Unexpected ']' at position $cursor")
+              }
+              bracketDepth -= 1
+              cursor += 1
+            case '{' if parenthesisDepth == 0 && bracketDepth == 0 =>
+              val prefix = content.substring(start, cursor)
+              if (isCustomProperty(prefix)) {
+                cursor = skipComponentBlock(cursor)
+              } else {
+                result = Delimiter.OpenBrace(cursor)
+                done = true
+              }
+            case ';' if parenthesisDepth == 0 && bracketDepth == 0 =>
+              result = Delimiter.Semicolon(cursor)
+              done = true
+            case '}' if parenthesisDepth == 0 && bracketDepth == 0 =>
+              result = Delimiter.CloseBrace(cursor)
+              done = true
+            case _ =>
+              cursor += 1
           }
         }
       }
 
-      if (foundBrace) {
-        // This is a nested rule - extract the whole block
-        j += 1 // skip '{'
-        var depth = 1
-        while (j < len && depth > 0) {
-          val c = body.charAt(j)
-          if (c == '"' || c == '\'') {
-            j = skipString(body, j, c)
-          } else {
-            c match {
-              case '{' => depth += 1; j += 1
-              case '}' => depth -= 1; j += 1
-              case _   => j += 1
-            }
-          }
+      if (!done) {
+        if (parenthesisDepth != 0) {
+          fail("Unclosed '(' before end of input")
         }
-        nestedContent.append(body.substring(lineStart, j))
-        nestedContent.append("\n")
-        i = j
-      } else if (foundSemicolon) {
-        // This is a property
-        val prop = body.substring(lineStart, j).trim
-        if (prop.nonEmpty) properties += prop
-        i = j + 1 // skip ';'
+        if (bracketDepth != 0) {
+          fail("Unclosed '[' before end of input")
+        }
+      }
+
+      result
+    }
+
+    private def skipString(start: Int, quote: Char): Int = {
+      var cursor = start + 1
+      var closed = false
+
+      while (cursor < length && !closed) {
+        content.charAt(cursor) match {
+          case '\\'                  => cursor = Math.min(cursor + 2, length)
+          case char if char == quote =>
+            cursor += 1
+            closed = true
+          case _ => cursor += 1
+        }
+      }
+
+      if (!closed) {
+        fail(s"Unclosed string starting at position $start")
+      }
+      cursor
+    }
+
+    private def skipComment(start: Int): Int = {
+      var cursor = start + 2
+      var closed = false
+
+      while (cursor + 1 < length && !closed) {
+        if (
+          content.charAt(cursor) == '*' && content.charAt(cursor + 1) == '/'
+        ) {
+          cursor += 2
+          closed = true
+        } else {
+          cursor += 1
+        }
+      }
+
+      if (!closed) {
+        fail(s"Unclosed comment starting at position $start")
+      }
+      cursor
+    }
+
+    private def skipEscape(start: Int): Int = {
+      var cursor = start + 1
+      val hexStart = cursor
+
+      while (
+        cursor < length &&
+        cursor - hexStart < 6 &&
+        isHexDigit(content.charAt(cursor))
+      ) {
+        cursor += 1
+      }
+
+      if (cursor > hexStart) {
+        if (cursor < length && content.charAt(cursor).isWhitespace) {
+          cursor += 1
+        }
+      } else if (cursor < length) {
+        cursor += 1
       } else {
-        // End of content, might be trailing property without semicolon
-        val prop = body.substring(lineStart, len).trim
-        if (prop.nonEmpty && !prop.contains("{")) properties += prop
-        i = len
+        fail(s"Invalid escape at position $start")
+      }
+      cursor
+    }
+
+    private def skipComponentBlock(start: Int): Int = {
+      var cursor = start + 1
+      var depth = 1
+
+      while (cursor < length && depth > 0) {
+        val current = content.charAt(cursor)
+        if (current == '"' || current == '\'') {
+          cursor = skipString(cursor, current)
+        } else if (
+          current == '/' && cursor + 1 < length && content.charAt(
+            cursor + 1
+          ) == '*'
+        ) {
+          cursor = skipComment(cursor)
+        } else if (current == '\\') {
+          cursor = skipEscape(cursor)
+        } else {
+          current match {
+            case '{' =>
+              depth += 1
+              cursor += 1
+            case '}' =>
+              depth -= 1
+              cursor += 1
+            case _ => cursor += 1
+          }
+        }
+      }
+
+      if (depth != 0) {
+        fail(s"Unclosed custom-property block starting at position $start")
+      }
+      cursor
+    }
+
+    private def isCustomProperty(prefix: String): Boolean = {
+      val significant = removeLeadingTrivia(prefix)
+      significant.startsWith("--") && significant.indexOf(':') >= 2
+    }
+
+    private def isHexDigit(char: Char): Boolean = {
+      (char >= '0' && char <= '9') ||
+      (char >= 'a' && char <= 'f') ||
+      (char >= 'A' && char <= 'F')
+    }
+
+    private def isAtRule(value: String): Boolean =
+      removeLeadingTrivia(value).startsWith("@")
+
+    private def containsOnlyTrivia(value: String): Boolean = {
+      var cursor = 0
+      var onlyTrivia = true
+
+      while (cursor < value.length && onlyTrivia) {
+        if (value.charAt(cursor).isWhitespace) {
+          cursor += 1
+        } else if (
+          value.charAt(cursor) == '/' &&
+          cursor + 1 < value.length &&
+          value.charAt(cursor + 1) == '*'
+        ) {
+          val close = value.indexOf("*/", cursor + 2)
+          if (close < 0) {
+            onlyTrivia = false
+          } else {
+            cursor = close + 2
+          }
+        } else {
+          onlyTrivia = false
+        }
+      }
+
+      onlyTrivia
+    }
+
+    private def removeLeadingTrivia(value: String): String = {
+      var cursor = 0
+      var scanning = true
+
+      while (cursor < value.length && scanning) {
+        if (value.charAt(cursor).isWhitespace) {
+          cursor += 1
+        } else if (
+          value.charAt(cursor) == '/' &&
+          cursor + 1 < value.length &&
+          value.charAt(cursor + 1) == '*'
+        ) {
+          val close = value.indexOf("*/", cursor + 2)
+          if (close < 0) {
+            scanning = false
+          } else {
+            cursor = close + 2
+          }
+        } else {
+          scanning = false
+        }
+      }
+
+      value.substring(cursor).trim
+    }
+
+    private def skipWhitespace(): Unit = {
+      while (index < length && content.charAt(index).isWhitespace) {
+        index += 1
       }
     }
-    (properties.toList, nestedContent.toString)
+
+    private def fail(message: String): Nothing = throw ParseFailure(message)
   }
 
-  private def renderRules(rules: List[Rule], sb: StringBuilder): Unit = {
-    rules.foreach { rule =>
-      // Render this rule if it has properties
-      if (rule.properties.nonEmpty) {
-        sb.append(rule.selector)
-        sb.append(" {\n")
-        rule.properties.foreach { prop =>
-          sb.append("  ")
-          sb.append(prop)
-          sb.append(";\n")
+  private final class Renderer(
+      dynamicMarkerPrefix: String,
+      shouldCollectClassNames: Boolean
+  ) {
+    private val output = StringBuilder()
+    private val classNames = mutable.LinkedHashSet.empty[String]
+
+    def render(items: List[Item]): Analysis = {
+      renderItems(items, Nil, indentation = 0)
+      Analysis(output.toString, classNames.toList)
+    }
+
+    private def renderItems(
+        items: List[Item],
+        parentSelectors: List[String],
+        indentation: Int
+    ): Unit = {
+      val pending = mutable.ListBuffer.empty[Item]
+
+      def flushPending(): Unit = {
+        if (pending.nonEmpty) {
+          if (parentSelectors.nonEmpty) {
+            renderSelectorBlock(parentSelectors, pending.toList, indentation)
+          } else {
+            renderLooseItems(pending.toList, indentation)
+          }
+          pending.clear()
         }
-        sb.append("}\n")
       }
-      // Render children
-      renderRules(rule.children, sb)
+
+      items.foreach {
+        case declaration: Declaration => pending += declaration
+        case raw: Raw                 => pending += raw
+        case atRule @ AtRule(_, None) => pending += atRule
+        case rule: QualifiedRule      =>
+          flushPending()
+          renderQualifiedRule(rule, parentSelectors, indentation)
+        case atRule: AtRule =>
+          flushPending()
+          renderAtRule(atRule, parentSelectors, indentation)
+      }
+
+      flushPending()
+    }
+
+    private def renderQualifiedRule(
+        rule: QualifiedRule,
+        parentSelectors: List[String],
+        indentation: Int
+    ): Unit = {
+      val childSelectors = splitSelectorList(rule.selector)
+      val selectors = combineSelectors(parentSelectors, childSelectors)
+      if (shouldCollectClassNames) {
+        selectors.foreach(collectClassNames)
+      }
+
+      if (rule.items.isEmpty) {
+        renderSelectorBlock(selectors, Nil, indentation)
+      } else {
+        renderItems(rule.items, selectors, indentation)
+      }
+    }
+
+    private def renderAtRule(
+        atRule: AtRule,
+        parentSelectors: List[String],
+        indentation: Int
+    ): Unit = {
+      appendIndent(indentation)
+      output.append(atRule.header)
+      output.append(" {\n")
+      atRule.items.foreach(renderItems(_, parentSelectors, indentation + 1))
+      appendIndent(indentation)
+      output.append("}\n")
+    }
+
+    private def renderSelectorBlock(
+        selectors: List[String],
+        items: List[Item],
+        indentation: Int
+    ): Unit = {
+      appendIndent(indentation)
+      output.append(selectors.mkString(", "))
+      output.append(" {\n")
+      renderLeafItems(items, indentation + 1)
+      appendIndent(indentation)
+      output.append("}\n")
+    }
+
+    private def renderLooseItems(items: List[Item], indentation: Int): Unit = {
+      renderLeafItems(items, indentation)
+    }
+
+    private def renderLeafItems(items: List[Item], indentation: Int): Unit = {
+      items.foreach {
+        case Declaration(value) =>
+          appendIndent(indentation)
+          output.append(value)
+          output.append(";\n")
+        case Raw(value) =>
+          appendIndent(indentation)
+          output.append(value)
+          output.append("\n")
+        case AtRule(header, None) =>
+          appendIndent(indentation)
+          output.append(header)
+          output.append(";\n")
+        case _ =>
+          throw IllegalStateException("Nested rule reached leaf renderer")
+      }
+    }
+
+    private def combineSelectors(
+        parentSelectors: List[String],
+        childSelectors: List[String]
+    ): List[String] = {
+      if (parentSelectors.isEmpty) {
+        childSelectors
+      } else {
+        parentSelectors.flatMap { parent =>
+          childSelectors.map { child =>
+            if (containsParentReference(child)) {
+              replaceParentReferences(child, parent)
+            } else {
+              s"$parent $child"
+            }
+          }
+        }
+      }
+    }
+
+    private def splitSelectorList(selector: String): List[String] = {
+      val selectors = mutable.ListBuffer.empty[String]
+      var start = 0
+      var cursor = 0
+      var parenthesisDepth = 0
+      var bracketDepth = 0
+
+      while (cursor < selector.length) {
+        val current = selector.charAt(cursor)
+        if (current == '"' || current == '\'') {
+          cursor = skipQuoted(selector, cursor, current)
+        } else if (
+          current == '/' &&
+          cursor + 1 < selector.length &&
+          selector.charAt(cursor + 1) == '*'
+        ) {
+          cursor = skipComment(selector, cursor)
+        } else if (current == '\\') {
+          cursor = skipEscape(selector, cursor)
+        } else {
+          current match {
+            case '(' =>
+              parenthesisDepth += 1
+              cursor += 1
+            case ')' =>
+              parenthesisDepth -= 1
+              cursor += 1
+            case '[' =>
+              bracketDepth += 1
+              cursor += 1
+            case ']' =>
+              bracketDepth -= 1
+              cursor += 1
+            case ',' if parenthesisDepth == 0 && bracketDepth == 0 =>
+              val part = selector.substring(start, cursor).trim
+              if (part.nonEmpty) {
+                selectors += part
+              }
+              cursor += 1
+              start = cursor
+            case _ => cursor += 1
+          }
+        }
+      }
+
+      val last = selector.substring(start).trim
+      if (last.nonEmpty) {
+        selectors += last
+      }
+      selectors.toList
+    }
+
+    private def containsParentReference(selector: String): Boolean = {
+      var cursor = 0
+      var bracketDepth = 0
+      var found = false
+
+      while (cursor < selector.length && !found) {
+        val current = selector.charAt(cursor)
+        if (current == '"' || current == '\'') {
+          cursor = skipQuoted(selector, cursor, current)
+        } else if (
+          current == '/' &&
+          cursor + 1 < selector.length &&
+          selector.charAt(cursor + 1) == '*'
+        ) {
+          cursor = skipComment(selector, cursor)
+        } else if (current == '\\') {
+          cursor = skipEscape(selector, cursor)
+        } else {
+          current match {
+            case '[' =>
+              bracketDepth += 1
+              cursor += 1
+            case ']' =>
+              bracketDepth -= 1
+              cursor += 1
+            case '&' if bracketDepth == 0 => found = true
+            case _                        => cursor += 1
+          }
+        }
+      }
+
+      found
+    }
+
+    private def replaceParentReferences(
+        selector: String,
+        parent: String
+    ): String = {
+      val replaced = StringBuilder(selector.length + parent.length)
+      var cursor = 0
+      var bracketDepth = 0
+
+      while (cursor < selector.length) {
+        val current = selector.charAt(cursor)
+        if (current == '"' || current == '\'') {
+          val end = skipQuoted(selector, cursor, current)
+          replaced.append(selector.substring(cursor, end))
+          cursor = end
+        } else if (
+          current == '/' &&
+          cursor + 1 < selector.length &&
+          selector.charAt(cursor + 1) == '*'
+        ) {
+          val end = skipComment(selector, cursor)
+          replaced.append(selector.substring(cursor, end))
+          cursor = end
+        } else if (current == '\\') {
+          val end = skipEscape(selector, cursor)
+          replaced.append(selector.substring(cursor, end))
+          cursor = end
+        } else {
+          current match {
+            case '[' =>
+              bracketDepth += 1
+              replaced.append(current)
+              cursor += 1
+            case ']' =>
+              bracketDepth -= 1
+              replaced.append(current)
+              cursor += 1
+            case '&' if bracketDepth == 0 =>
+              replaced.append(parent)
+              cursor += 1
+            case _ =>
+              replaced.append(current)
+              cursor += 1
+          }
+        }
+      }
+
+      replaced.toString
+    }
+
+    private def collectClassNames(selector: String): Unit = {
+      var cursor = 0
+      var bracketDepth = 0
+
+      while (cursor < selector.length) {
+        val current = selector.charAt(cursor)
+        if (current == '"' || current == '\'') {
+          cursor = skipQuoted(selector, cursor, current)
+        } else if (
+          current == '/' &&
+          cursor + 1 < selector.length &&
+          selector.charAt(cursor + 1) == '*'
+        ) {
+          cursor = skipComment(selector, cursor)
+        } else if (current == '\\') {
+          cursor = skipEscape(selector, cursor)
+        } else {
+          current match {
+            case '[' =>
+              bracketDepth += 1
+              cursor += 1
+            case ']' =>
+              bracketDepth -= 1
+              cursor += 1
+            case '.'
+                if bracketDepth == 0 && isIdentifierStart(
+                  selector,
+                  cursor + 1
+                ) =>
+              val (name, rawName, end) = readIdentifier(selector, cursor + 1)
+              if (
+                name.nonEmpty &&
+                (dynamicMarkerPrefix.isEmpty || !rawName.contains(
+                  dynamicMarkerPrefix
+                ))
+              ) {
+                classNames += name
+              }
+              cursor = end
+            case _ => cursor += 1
+          }
+        }
+      }
+    }
+
+    private def readIdentifier(
+        value: String,
+        start: Int
+    ): (String, String, Int) = {
+      val decoded = StringBuilder()
+      var cursor = start
+      var scanning = true
+
+      while (cursor < value.length && scanning) {
+        val current = value.charAt(cursor)
+        if (isIdentifierPart(current)) {
+          decoded.append(current)
+          cursor += 1
+        } else if (current == '\\' && cursor + 1 < value.length) {
+          val (escaped, end) = readEscape(value, cursor)
+          decoded.append(escaped)
+          cursor = end
+        } else {
+          scanning = false
+        }
+      }
+
+      (decoded.toString, value.substring(start, cursor), cursor)
+    }
+
+    private def readEscape(value: String, start: Int): (String, Int) = {
+      var cursor = start + 1
+      val hexStart = cursor
+
+      while (
+        cursor < value.length &&
+        cursor - hexStart < 6 &&
+        isHexDigit(value.charAt(cursor))
+      ) {
+        cursor += 1
+      }
+
+      if (cursor > hexStart) {
+        val parsedCodePoint = Integer.parseInt(
+          value.substring(hexStart, cursor),
+          16
+        )
+        val codePoint =
+          if (
+            parsedCodePoint == 0 ||
+            parsedCodePoint > Character.MAX_CODE_POINT ||
+            (parsedCodePoint >= Character.MIN_SURROGATE.toInt &&
+              parsedCodePoint <= Character.MAX_SURROGATE.toInt)
+          ) {
+            0xfffd
+          } else {
+            parsedCodePoint
+          }
+        if (cursor < value.length && value.charAt(cursor).isWhitespace) {
+          cursor += 1
+        }
+        (String(Character.toChars(codePoint)), cursor)
+      } else if (cursor < value.length) {
+        (value.charAt(cursor).toString, cursor + 1)
+      } else {
+        ("", cursor)
+      }
+    }
+
+    private def isIdentifierStart(value: String, position: Int): Boolean = {
+      position < value.length && {
+        val char = value.charAt(position)
+        char == '-' ||
+        char == '_' ||
+        char == '\\' ||
+        char.isLetter ||
+        char >= 128
+      }
+    }
+
+    private def isIdentifierPart(char: Char): Boolean = {
+      char == '-' ||
+      char == '_' ||
+      char.isLetterOrDigit ||
+      char >= 128
+    }
+
+    private def isHexDigit(char: Char): Boolean = {
+      (char >= '0' && char <= '9') ||
+      (char >= 'a' && char <= 'f') ||
+      (char >= 'A' && char <= 'F')
+    }
+
+    private def skipQuoted(value: String, start: Int, quote: Char): Int = {
+      var cursor = start + 1
+      var closed = false
+
+      while (cursor < value.length && !closed) {
+        value.charAt(cursor) match {
+          case '\\' => cursor = Math.min(cursor + 2, value.length)
+          case char if char == quote =>
+            cursor += 1
+            closed = true
+          case _ => cursor += 1
+        }
+      }
+      cursor
+    }
+
+    private def skipComment(value: String, start: Int): Int = {
+      val close = value.indexOf("*/", start + 2)
+      if (close < 0) value.length else close + 2
+    }
+
+    private def skipEscape(value: String, start: Int): Int = {
+      var cursor = start + 1
+      val hexStart = cursor
+
+      while (
+        cursor < value.length &&
+        cursor - hexStart < 6 &&
+        isHexDigit(value.charAt(cursor))
+      ) {
+        cursor += 1
+      }
+
+      if (cursor > hexStart) {
+        if (cursor < value.length && value.charAt(cursor).isWhitespace) {
+          cursor += 1
+        }
+      } else if (cursor < value.length) {
+        cursor += 1
+      }
+      cursor
+    }
+
+    private def appendIndent(indentation: Int): Unit = {
+      var count = 0
+      while (count < indentation) {
+        output.append("  ")
+        count += 1
+      }
     }
   }
 }
 
 object CssMacro {
-  // Pre-compiled regex pattern for extracting CSS class names
-  private val classPattern = """\.([\w-]+)""".r
+  private val dynamicMarkerPrefix = "__CSS_MACRO_INTERPOLATION_"
 
-  /** Implicit conversion to extract just the CSS string when assigned to a
-    * String. Usage: import CssMacro.css import CssMacro.cssResultToString // or
-    * use `given` import val s: String = css".button { color: red; }" //
-    * extracts just the CSS string
+  /** Enables assigning a CSS result directly to `String` when callers opt in to
+    * `scala.language.implicitConversions`.
     */
   given cssResultToString[T]: Conversion[(css: String, classNames: T), String] =
     result => result.css
 
-  // String interpolator version: css"..." with interpolation support
   extension (inline sc: StringContext) {
     transparent inline def css(inline args: Any*): Any = ${
       cssInterpolatorImpl('sc, 'args)
@@ -220,210 +883,127 @@ object CssMacro {
       scExpr: Expr[StringContext],
       argsExpr: Expr[Seq[Any]]
   )(using Quotes): Expr[Any] = {
-    import quotes.reflect.*
-
-    // Extract the static parts from StringContext at compile time
     val parts: List[String] = scExpr match {
       case '{ StringContext(${ Varargs(Exprs(parts)) }*) } => parts.toList
       case _                                               =>
-        report.errorAndAbort("css interpolator requires literal string parts")
+        quotes.reflect.report.errorAndAbort(
+          "css interpolator requires literal string parts"
+        )
     }
 
-    val allStaticCss = parts.mkString
-
-    // Validate CSS syntax at compile time
-    validateCss(allStaticCss) match {
-      case Some(error) => report.errorAndAbort(s"CSS syntax error: $error")
-      case None        => // Valid CSS
+    val skeleton = buildSkeleton(parts)
+    val analysis = CssFlattener.analyze(skeleton, dynamicMarkerPrefix) match {
+      case Right(value) => value
+      case Left(error)  =>
+        quotes.reflect.report.errorAndAbort(s"CSS syntax error: $error")
     }
 
-    // Flatten first, then extract class names from the flattened output
-    // This ensures class names generated from & references are captured
-    val flattenedStaticCss = flattenNestedCss(allStaticCss)
-    val classNames = extractClassNames(flattenedStaticCss)
+    val (classNamesExpr, classNamesType) =
+      buildClassNames(analysis.classNames)
 
-    val fields = classNames.map(name => (name, name)).distinctBy(_._1)
-
-    // Build the classNames tuple and its type together to avoid duplicate work
-    val (classNamesTupleExpr, classNamesType) = buildClassNamesTuple(fields)
-
-    // Build the CSS string - optimize for static case (no interpolations)
-    val cssStringExpr = argsExpr match {
-      case '{ Seq() } | '{ Nil } | '{ Seq.empty } =>
-        // No interpolations - return pre-flattened constant string
-        Expr(flattenedStaticCss)
-      case Varargs(argExprs) if argExprs.isEmpty =>
-        // Empty varargs - return pre-flattened constant string
-        Expr(flattenedStaticCss)
-      case _ =>
-        // Has interpolations - build at runtime then flatten
-        '{
-          val partsIter = $scExpr.parts.iterator
-          val argsIter = $argsExpr.iterator
-          val sb = new StringBuilder(${ Expr(allStaticCss.length + 64) })
-          while (partsIter.hasNext) {
-            sb.append(partsIter.next())
-            if (argsIter.hasNext) sb.append(argsIter.next().toString)
+    val cssStringExpr = if (parts.length == 1) {
+      buildStaticCssExpression(analysis.css)
+    } else {
+      '{
+        val partsIterator = $scExpr.parts.iterator
+        val argumentsIterator = $argsExpr.iterator
+        val builder = StringBuilder(${ Expr(skeleton.length + 64) })
+        while (partsIterator.hasNext) {
+          builder.append(partsIterator.next())
+          if (argumentsIterator.hasNext) {
+            builder.append(argumentsIterator.next().toString)
           }
-          CssFlattener.flatten(sb.toString)
         }
+        CssFlattener.flatten(builder.toString)
+      }
     }
 
-    // Build outer named tuple: (css: String, classNames: <inner named tuple>)
-    buildResultTuple(cssStringExpr, classNamesTupleExpr, classNamesType)
+    buildResult(cssStringExpr, classNamesExpr, classNamesType)
   }
 
-  private def extractClassNames(css: String): List[String] =
-    classPattern.findAllMatchIn(css).map(_.group(1)).toList.distinct
+  private def buildSkeleton(parts: List[String]): String = {
+    val builder = StringBuilder(parts.iterator.map(_.length).sum + 64)
+    var index = 0
 
-  /** Validate CSS syntax. Returns Some(errorMessage) if invalid, None if valid.
-    * Note: This validates the static parts only - interpolation placeholders
-    * are represented as empty strings, so we allow empty values after ':'.
-    */
-  private def validateCss(css: String): Option[String] = {
-    val trimmed = css.trim
-    if (trimmed.isEmpty) None
-    else checkBalancedBraces(css).orElse(checkMissingSelector(trimmed))
+    parts.foreach { part =>
+      if (index > 0) {
+        builder.append(dynamicMarkerPrefix)
+        builder.append(index - 1)
+        builder.append("__")
+      }
+      builder.append(part)
+      index += 1
+    }
+    builder.toString
   }
 
-  private def checkBalancedBraces(css: String): Option[String] = {
-    var braceCount = 0
-    var inString = false
-    var stringChar = ' '
-    var i = 0
-    while (i < css.length) {
-      val c = css(i)
-      if (inString) {
-        if (c == stringChar && (i == 0 || css(i - 1) != '\\')) {
-          inString = false
-        }
-      } else {
-        c match {
-          case '"' | '\'' =>
-            inString = true
-            stringChar = c
-          case '{' => braceCount += 1
-          case '}' =>
-            braceCount -= 1
-            if (braceCount < 0) {
-              return Some(s"Unexpected '}' at position $i - no matching '{'")
-            }
-          case _ =>
+  private def buildStaticCssExpression(
+      css: String
+  )(using Quotes): Expr[String] = {
+    val maximumChunkLength = 16000
+    if (css.length <= maximumChunkLength) {
+      Expr(css)
+    } else {
+      val chunksExpression = Expr.ofList(
+        css.grouped(maximumChunkLength).map(Expr(_)).toList
+      )
+      '{
+        val builder = StringBuilder(${ Expr(css.length) })
+        $chunksExpression.foreach(builder.append)
+        builder.toString
+      }
+    }
+  }
+
+  private def buildClassNames(
+      classNames: List[String]
+  )(using q: Quotes): (Expr[Any], q.reflect.TypeRepr) = {
+    val baseType = q.reflect.TypeRepr.of[CssClassNames]
+    val refinementBlockSize = 128
+    var level: IndexedSeq[q.reflect.TypeRepr] = classNames
+      .grouped(refinementBlockSize)
+      .map { names =>
+        names.foldLeft(baseType) { (owner, name) =>
+          q.reflect.Refinement(owner, name, q.reflect.TypeRepr.of[String])
         }
       }
-      i += 1
+      .toIndexedSeq
+
+    while (level.length > 1) {
+      val next = mutable.ArrayBuffer.empty[q.reflect.TypeRepr]
+      var index = 0
+      while (index < level.length) {
+        if (index + 1 < level.length) {
+          next += q.reflect.AndType(level(index), level(index + 1))
+        } else {
+          next += level(index)
+        }
+        index += 2
+      }
+      level = next.toIndexedSeq
     }
-    if (braceCount != 0) {
-      Some(
-        s"Unbalanced braces: ${Math.abs(braceCount)} unclosed '${"{"}'${
-            if (braceCount > 1) "s"
-            else ""
-          }"
-      )
-    } else None
-  }
 
-  private def checkMissingSelector(css: String): Option[String] = {
-    // Check for selector before opening brace (outside of nested context)
-    val selectorBeforeBrace = """^\s*\{""".r
-    if (selectorBeforeBrace.findFirstIn(css).isDefined) {
-      Some("Missing selector before '{'")
-    } else None
-  }
-
-  /** Flatten nested CSS selectors at compile time */
-  private def flattenNestedCss(css: String): String =
-    CssFlattener.flatten(css)
-
-  // Returns both the expression and the type to avoid rebuilding the type
-  private def buildClassNamesTuple(
-      fields: List[(String, String)]
-  )(using q: Quotes): (Expr[Any], q.reflect.TypeRepr) = {
-    import q.reflect.*
-
-    fields match {
-      case Nil =>
-        (
-          '{ EmptyTuple },
-          TypeRepr.of[NamedTuple.NamedTuple[EmptyTuple, EmptyTuple]]
-        )
-      case _ =>
-        val tupleExpr = Expr.ofTupleFromSeq(fields.map(f => Expr(f._2)))
-
-        // Build label types tuple
-        val labelsTupleType = fields.foldRight(TypeRepr.of[EmptyTuple]) {
-          case ((fieldName, _), acc) =>
-            TypeRepr
-              .of[*:]
-              .appliedTo(List(ConstantType(StringConstant(fieldName)), acc))
-        }
-
-        // Build values types tuple (all Strings)
-        val valuesTupleType = fields.foldRight(TypeRepr.of[EmptyTuple]) {
-          (_, acc) =>
-            TypeRepr.of[*:].appliedTo(List(TypeRepr.of[String], acc))
-        }
-
-        val namedTupleType = TypeRepr
-          .of[NamedTuple.NamedTuple]
-          .appliedTo(List(labelsTupleType, valuesTupleType))
-
-        val expr = namedTupleType.asType match {
-          case '[t] => '{ $tupleExpr.asInstanceOf[t] }
-        }
-
-        (expr, namedTupleType)
+    val classNamesType = level.headOption.getOrElse(baseType)
+    val expression = classNamesType.asType match {
+      case '[classNamesType] =>
+        '{ CssClassNames().asInstanceOf[classNamesType] }
     }
+    (expression, classNamesType)
   }
 
-  private def buildResultTuple(
+  private def buildResult(
       cssExpr: Expr[String],
       classNamesExpr: Expr[Any],
-      classNamesType: Any // TypeRepr passed as Any to avoid path-dependent type issues
+      classNamesType: Any
   )(using q: Quotes): Expr[Any] = {
-    import q.reflect.*
-    val classNamesTypeRepr = classNamesType.asInstanceOf[TypeRepr]
-
-    // Build outer named tuple type: (css: String, classNames: <inner type>)
-    val outerLabelsTupleType = TypeRepr
-      .of[*:]
-      .appliedTo(
-        List(
-          ConstantType(StringConstant("css")),
-          TypeRepr
-            .of[*:]
-            .appliedTo(
-              List(
-                ConstantType(StringConstant("classNames")),
-                TypeRepr.of[EmptyTuple]
-              )
-            )
-        )
-      )
-
-    val outerValuesTupleType = TypeRepr
-      .of[*:]
-      .appliedTo(
-        List(
-          TypeRepr.of[String],
-          TypeRepr
-            .of[*:]
-            .appliedTo(
-              List(
-                classNamesTypeRepr,
-                TypeRepr.of[EmptyTuple]
-              )
-            )
-        )
-      )
-
-    val outerNamedTupleType = TypeRepr
-      .of[NamedTuple.NamedTuple]
-      .appliedTo(List(outerLabelsTupleType, outerValuesTupleType))
-
-    outerNamedTupleType.asType match {
-      case '[t] =>
-        '{ ($cssExpr, $classNamesExpr).asInstanceOf[t] }
+    classNamesType.asInstanceOf[q.reflect.TypeRepr].asType match {
+      case '[classNamesType] =>
+        '{
+          (
+            css = $cssExpr,
+            classNames = $classNamesExpr.asInstanceOf[classNamesType]
+          )
+        }
     }
   }
 }

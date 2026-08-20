@@ -1,9 +1,9 @@
-//> using scala 3.7.3
-//> using test.dep org.scalameta::munit::1.2.1
+//> using test.dep org.scalameta::munit::1.3.5
 
 package www
 
-import CssMacro.css
+import CssMacro.{css, cssResultToString}
+import scala.language.implicitConversions
 
 class CssMacroTest extends munit.FunSuite {
 
@@ -974,6 +974,196 @@ class CssMacroTest extends munit.FunSuite {
     assertEquals(styles.classNames.`wrapper__body`, "wrapper__body")
   }
 
+  // === Parser Correctness Regression Tests ===
+
+  test("expands nested selector lists as a Cartesian product") {
+    val styles = css"""
+      .a, .b {
+        .c, .d {
+          color: red;
+        }
+      }
+    """
+    assertEquals(
+      styles.css,
+      ".a .c, .a .d, .b .c, .b .d {\n  color: red;\n}\n"
+    )
+  }
+
+  test("preserves top-level conditional at-rules") {
+    val styles = css"""
+      @media (min-width: 40rem) {
+        .card {
+          color: red;
+        }
+      }
+    """
+    assertEquals(
+      styles.css,
+      "@media (min-width: 40rem) {\n" +
+        "  .card {\n" +
+        "    color: red;\n" +
+        "  }\n" +
+        "}\n"
+    )
+    assertEquals(styles.classNames.card, "card")
+  }
+
+  test("lifts nested conditional at-rules without losing the parent selector") {
+    val styles = css"""
+      .card {
+        @media (min-width: 40rem) {
+          color: red;
+          .title {
+            font-weight: bold;
+          }
+        }
+      }
+    """
+    assertEquals(
+      styles.css,
+      "@media (min-width: 40rem) {\n" +
+        "  .card {\n" +
+        "    color: red;\n" +
+        "  }\n" +
+        "  .card .title {\n" +
+        "    font-weight: bold;\n" +
+        "  }\n" +
+        "}\n"
+    )
+  }
+
+  test("preserves keyframe steps instead of treating them as descendants") {
+    val styles = css"""
+      @keyframes fade {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+    """
+    assertEquals(
+      styles.css,
+      "@keyframes fade {\n" +
+        "  from {\n" +
+        "    opacity: 0;\n" +
+        "  }\n" +
+        "  to {\n" +
+        "    opacity: 1;\n" +
+        "  }\n" +
+        "}\n"
+    )
+  }
+
+  test("ignores structural punctuation inside comments") {
+    val styles = css"""
+      .card {
+        /* } ; { .ghost */
+        color: red;
+      }
+    """
+    assert(styles.css.contains("/* } ; { .ghost */"))
+    assert(styles.css.contains("color: red"))
+    assertEquals(styles.classNames.card, "card")
+  }
+
+  test("does not expose classes found in values strings URLs or comments") {
+    val valueErrors = scala.compiletime.testing.typeCheckErrors(
+      """import www.CssMacro.css; val styles = css".card { opacity: 0.5; }"; styles.classNames.`5`"""
+    )
+    val urlErrors = scala.compiletime.testing.typeCheckErrors(
+      """import www.CssMacro.css; val styles = css".card { background: url(https://cdn.example.com/a.jpg); }"; styles.classNames.example"""
+    )
+    val stringErrors = scala.compiletime.testing.typeCheckErrors(
+      """import www.CssMacro.css; val styles = css".card { content: '.ghost'; }"; styles.classNames.ghost"""
+    )
+
+    assert(valueErrors.nonEmpty)
+    assert(urlErrors.nonEmpty)
+    assert(stringErrors.nonEmpty)
+  }
+
+  test("supports a fully interpolated selector") {
+    val selector = ".dynamic"
+    val styles = css"""$selector { color: red; }"""
+    assertEquals(styles.css, ".dynamic {\n  color: red;\n}\n")
+  }
+
+  test("keeps static parent classes when a nested class is dynamic") {
+    val modifier = "primary"
+    val styles = css"""
+      .button {
+        &--$modifier { color: red; }
+      }
+    """
+    assertEquals(styles.classNames.button, "button")
+    assert(styles.css.contains(".button--primary"))
+  }
+
+  test("preserves declaration order around nested rules") {
+    val styles = css"""
+      .parent {
+        color: red;
+        .child { color: green; }
+        color: blue;
+      }
+    """
+    assertEquals(
+      styles.css,
+      ".parent {\n" +
+        "  color: red;\n" +
+        "}\n" +
+        ".parent .child {\n" +
+        "  color: green;\n" +
+        "}\n" +
+        ".parent {\n" +
+        "  color: blue;\n" +
+        "}\n"
+    )
+  }
+
+  test("preserves balanced component blocks in custom properties") {
+    val styles = css"""
+      .theme {
+        --tokens: { primary: red; nested: { contrast: blue; }; };
+        color: var(--primary);
+      }
+    """
+    assert(styles.css.contains("--tokens: { primary: red; nested:"))
+    assert(styles.css.contains("color: var(--primary)"))
+  }
+
+  test("decodes escaped CSS identifiers for class-name access") {
+    val styles = css"""
+      .field\:active { color: green; }
+      .caf\00e9 { color: brown; }
+    """
+    assertEquals(styles.classNames.`field:active`, "field:active")
+    assertEquals(styles.classNames.café, "café")
+  }
+
+  test("does not treat escaped selector punctuation as structure") {
+    val styles = css"""
+      .parent {
+        .rock\&roll, .state\,active { color: green; }
+      }
+    """
+    assert(
+      styles.css.contains(".parent .rock\\&roll, .parent .state\\,active")
+    )
+    assertEquals(styles.classNames.`rock&roll`, "rock&roll")
+    assertEquals(styles.classNames.`state,active`, "state,active")
+  }
+
+  test("flattens large sibling rule sets without recursive parsing") {
+    val input = (0 until 20000)
+      .map(index => s".class-$index { order: $index; }")
+      .mkString("\n")
+    val output = CssFlattener.flatten(input)
+
+    assert(output.startsWith(".class-0 {"))
+    assert(output.contains(".class-10000 {"))
+    assert(output.endsWith("}\n"))
+  }
+
   // === Validation Tests (compile-time errors) ===
   // These tests verify that invalid CSS produces compile-time errors
   // We use compiletime.testing.typeCheckErrors to verify error messages
@@ -1062,21 +1252,18 @@ class CssMacroTest extends munit.FunSuite {
   // === Implicit Conversion Tests ===
 
   test("implicit conversion to String when type annotated") {
-    import CssMacro.cssResultToString
     val cssString: String = css".button { color: red; }"
     assert(cssString.contains(".button"))
     assert(cssString.contains("color: red"))
   }
 
   test("implicit conversion works with interpolation") {
-    import CssMacro.cssResultToString
     val color = "blue"
     val cssString: String = css".link { color: $color; }"
     assert(cssString.contains("color: blue"))
   }
 
   test("implicit conversion works with nested selectors") {
-    import CssMacro.cssResultToString
     val cssString: String = css"""
       .parent {
         .child { color: green; }
@@ -1087,7 +1274,6 @@ class CssMacroTest extends munit.FunSuite {
   }
 
   test("implicit conversion can be used in function expecting String") {
-    import CssMacro.cssResultToString
     def useString(s: String): String = s.toUpperCase
     val result = useString(css".test { display: block; }")
     assert(result.contains(".TEST"))

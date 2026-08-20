@@ -2,18 +2,20 @@ https://github.com/user-attachments/assets/145834e5-87a4-469b-ab2b-65ed06fe048a
 
 # CSS Macro for Scala 3
 
-A compile-time CSS string interpolator with nested selector flattening, syntax validation, and type-safe class name access via Scala 3 named tuples.
+A compile-time CSS string interpolator with nested selector flattening, syntax validation, and type-safe access to statically known class names.
 
 ## Features
 
 - **Nested selector flattening**: Write SCSS-like nested CSS, get flat CSS output
 - **Parent selector (`&`)**: Use `&:hover`, `&--modifier` for BEM-style selectors
 - **CSS combinators**: Full support for `>`, `+`, `~` combinators
+- **Selector lists**: Correct Cartesian expansion of nested comma-separated selectors
+- **CSS at-rules**: Preserves `@media`, `@supports`, `@container`, `@keyframes`, and other at-rules
 - **String interpolation**: Use `$variable` or `${expression}` for dynamic CSS values
-- **Compile-time validation**: Catches unbalanced braces and missing selectors at compile-time
-- **Compile-time class extraction**: All class names (including generated ones) extracted at compile-time
-- **Type-safe class names**: Access class names as fields on a named tuple with full IDE support
-- **Named tuple return**: Returns `(css: String, classNames: (...))` tuple
+- **Compile-time validation**: Catches unbalanced blocks, comments, strings, parentheses, brackets, and missing selectors
+- **Compile-time class extraction**: Extracts class selectors without mistaking values, URLs, strings, attributes, or comments for classes
+- **Type-safe class names**: Access statically known class names as fields with full IDE support
+- **Compact runtime result**: Returns `(css: String, classNames: CssClassNames)` without allocating one string per class
 
 ## Usage
 
@@ -43,6 +45,16 @@ println(styles.css)
 // Access class names (type-safe!)
 println(styles.classNames.container)  // "container"
 println(styles.classNames.button)     // "button"
+```
+
+To opt into direct conversion of a CSS result to `String`, explicitly enable
+Scala conversions:
+
+```scala
+import scala.language.implicitConversions
+import www.CssMacro.{css, cssResultToString}
+
+val stylesheet: String = css".button { color: red; }"
 ```
 
 ### Nested Selectors
@@ -314,6 +326,30 @@ val buttonStyles = css"""
 // Generates: .btn:hover and .btn--primary
 ```
 
+Interpolated selector fragments are flattened at runtime. Because their final
+text is not known to the compiler, they are intentionally not exposed as typed
+`classNames` fields. Static classes in the same CSS block remain type-safe.
+
+### At-Rules
+
+At-rules keep their structural role while nested selectors are flattened:
+
+```scala
+val styles = css"""
+  .card {
+    @media (min-width: 40rem) {
+      padding: 24px;
+      .title { font-size: 20px; }
+    }
+  }
+"""
+
+// @media (min-width: 40rem) {
+//   .card { padding: 24px; }
+//   .card .title { font-size: 20px; }
+// }
+```
+
 ### Deep Nesting
 
 Arbitrary nesting depth is supported:
@@ -429,25 +465,26 @@ The `css` interpolator returns a named tuple with two fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `css` | `String` | The flattened CSS string with interpolated values |
-| `classNames` | Named Tuple | A named tuple where each field is a class name |
+| `classNames` | Structural `CssClassNames` record | One field for each statically known class selector |
 
 ## How It Works
 
 1. **At compile-time**:
-   - Validates CSS syntax (balanced braces, selectors present)
-   - Flattens nested CSS selectors
+   - Parses comments, strings, component values, rules, declarations, and at-rules
+   - Validates structural CSS syntax
+   - Flattens nested selector lists in linear time
    - Resolves `&` parent references
-   - Extracts all class names from the flattened output
-   - Builds a typed named tuple for class name access
-2. **At runtime** (with interpolations): The CSS string is built and flattened
-3. **Return value**: A named tuple with the CSS string and all extracted class names
+   - Extracts statically known classes from selectors only
+   - Builds a balanced structural record type for class-name access
+2. **At runtime** (with interpolations): The final CSS string is built and flattened with the same parser
+3. **Return value**: A named tuple containing the CSS string and a compact class-name record
 
 ## Development
 
 ```bash
 # Run tests
-scala-cli test src
+scala-cli test src --js-runtime bun
 
 # Run example
-scala-cli run src
+scala-cli run src --js-runtime bun
 ```
