@@ -1,4 +1,4 @@
-//> using scala 3.8.0
+//> using scala 3.8.4
 //> using platform scala-js
 //> using jsModuleKind es
 

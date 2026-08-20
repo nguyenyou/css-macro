@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: VirtusLab/scala-cli-setup@v1
+      - uses: oven-sh/setup-bun@v2
+      - name: Check formatting
+        run: scala-cli fmt --check src
+      - name: Test
+        run: >-
+          scala-cli test src
+          --server=false
+          --require-tests
+          --js-runtime bun
+          --scalac-option -feature
+          --scalac-option -Werror
